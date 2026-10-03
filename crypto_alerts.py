@@ -49,15 +49,7 @@ Réponds UNIQUEMENT par un tableau JSON (vide [] si rien) :
 
 MIN_LAUNCH_IMPORTANCE = 3
 
-# Communiqués de presse et médias crypto (modifiables ; une source en panne est ignorée)
-PRESS_FEEDS = {
-    "Chainwire (communiqués)": "https://chainwire.org/feed/",
-    "The Block": "https://www.theblock.co/rss.xml",
-    "Decrypt": "https://decrypt.co/feed",
-    "CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "Cointelegraph": "https://cointelegraph.com/rss",
-    "Blockworks": "https://blockworks.co/feed",
-}
+PRESS_FEEDS = cc.PRESS_FEEDS   # liste partagée avec l'app (crypto_core.py)
 
 # Pré-filtre gratuit par mots-clés, pour ne payer l'IA que sur les articles pertinents
 KEYWORDS = re.compile(
@@ -242,26 +234,42 @@ def run(state, send, esc, llm_cfg, first=False):
                  f"Menée par : {esc(', '.join(r.get('leadInvestors') or []) or 'non précisé')}"
                  + (f"\n⭐ Investisseurs de premier plan : {esc(', '.join(t1[:4]))}" if t1 else "")
                  + "\n<i>Projet à surveiller : un token peut suivre, sans garantie.</i>")
-    except Exception as ex:
-        errors.append(f"DefiLlama levées : {type(ex).__name__}")
+    except Exception:
+        pass        # levées DefiLlama réservées à l'offre Pro : on passe par les médias (section 5)
 
     # --- 5. Communiqués de presse et médias crypto -----------------------------
     press_first = first or not state.get("press_started")
-    cutoff = datetime.now(timezone.utc).timestamp() - 48 * 3600
-    cands = []
-    for label, url in PRESS_FEEDS.items():
+    items, perr = cc.press_items(days=2)
+    errors += [f"presse {e}" for e in perr]
+    new_items = []
+    for it in items:
+        pid = "press-" + it["id"]
+        if pid not in seen:
+            seen.add(pid)
+            new_items.append(it)
+    cands = [it for it in new_items if KEYWORDS.search(f"{it['title']} {it['summary']}")]
+
+    # levées de fonds repérées dans les médias (≥ 20 M$ ou investisseur de premier plan)
+    if new_items and not press_first:
         try:
-            r = requests.get(url, headers=UA, timeout=20)
-            r.raise_for_status()
-            for it in core.parse_feed(r.content, label, "Crypto"):
-                pid = "press-" + it["id"]
-                if pid in seen or it["time"].timestamp() < cutoff:
+            for rz in cc.raises_from_news(llm_cfg, {}, new_items):
+                rk = "raisename-" + re.sub(r"\W+", "", rz["name"].lower())
+                if rk in seen:
                     continue
-                seen.add(pid)
-                if KEYWORDS.search(f"{it['title']} {it['summary']}"):
-                    cands.append(it)
+                seen.add(rk)
+                t1 = cc.is_tier1(rz["leadInvestors"] + rz["otherInvestors"])
+                if not ((rz["amount"] or 0) >= 20 or t1):
+                    continue
+                amt = f"{rz['amount']:g} M$" if rz["amount"] is not None else "montant non communiqué"
+                send(f"🏦 <b>Levée de fonds : {esc(rz['name'])}</b> · {esc(amt)} ({esc(rz['round'] or 'tour non précisé')})\n"
+                     f"{esc(rz.get('category') or '')}\n"
+                     f"Menée par : {esc(', '.join(rz['leadInvestors']) or 'non précisé')}"
+                     + (f"\n⭐ Investisseurs de premier plan : {esc(', '.join(t1[:4]))}" if t1 else "")
+                     + (f"\n{esc(rz['resume'])}" if rz.get("resume") else "")
+                     + f"\n<i>Source : {esc(rz['source_name'])}</i> {esc(rz['source'])}"
+                     + "\n<i>Projet à surveiller : un token peut suivre, sans garantie.</i>")
         except Exception as ex:
-            errors.append(f"presse {label} : {type(ex).__name__}")
+            errors.append(f"levées (médias) : {type(ex).__name__}")
     state["press_started"] = True
     if cands and not press_first:
         try:

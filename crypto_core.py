@@ -3,11 +3,14 @@
 crypto_core.py — données et score de sérieux des nouveaux lancements crypto.
 Sources gratuites : DefiLlama (protocoles, frais, levées de fonds) et CoinGecko (token, tendances).
 """
+import json
 import math
+import re
 import time
 
 import requests
 
+import core
 from core import UA
 
 LLAMA = "https://api.llama.fi"
@@ -20,6 +23,28 @@ TIER1 = ["a16z", "andreessen", "paradigm", "polychain", "pantera", "coinbase ven
          "blockchain capital", "lightspeed", "haun", "ribbit", "tiger", "animoca", "okx ventures"]
 
 EXCLUDED_CATEGORIES = {"CEX", "Chain"}
+
+# Médias crypto et communiqués (utilisés pour les levées de fonds et les annonces de lancement)
+PRESS_FEEDS = {
+    "Chainwire (communiqués)": "https://chainwire.org/feed/",
+    "The Block": "https://www.theblock.co/rss.xml",
+    "Decrypt": "https://decrypt.co/feed",
+    "CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "Cointelegraph": "https://cointelegraph.com/rss",
+    "Blockworks": "https://blockworks.co/feed",
+}
+
+RAISE_KEYWORDS = re.compile(r"\brais(e|es|ed|ing)\b|funding|seed round|pre-seed|series [a-e]\b|"
+                            r"strategic round|led by|investment from|backed by", re.I)
+
+RAISE_PROMPT = """Tu lis des titres et résumés d'articles crypto. Garde UNIQUEMENT les annonces de
+LEVÉE DE FONDS d'un projet crypto / web3 précis (seed, série A, tour stratégique...).
+IGNORE : flux des ETF, rachats d'entreprises, levées de sociétés non crypto, hausses de prix.
+N'invente rien : null si absent. Montant en MILLIONS de dollars (nombre).
+Réponds UNIQUEMENT par un tableau JSON (vide [] si rien) :
+[{"id": "...", "projet": "...", "montant_musd": 12.5, "tour": "Seed|Série A|...|null",
+  "investisseurs_principaux": ["..."], "autres_investisseurs": ["..."],
+  "categorie": "DeFi|Infrastructure|IA|Jeux|Paiements|...", "resume": "1 phrase en français"}]"""
 
 
 def _get(url, params=None, headers=None, timeout=30):
@@ -57,9 +82,57 @@ def fetch_fees():
 
 
 def fetch_raises(days):
+    """Levées de fonds DefiLlama. ATTENTION : réservé à l'offre Pro depuis 2026 (erreur sinon)."""
     data = _get(f"{LLAMA}/raises")
     cutoff = time.time() - days * 86400
     return [r for r in data.get("raises", []) if (r.get("date") or 0) >= cutoff]
+
+
+def press_items(days=7):
+    """Articles récents des médias crypto. Renvoie (articles, erreurs)."""
+    items, errors = [], []
+    cutoff = time.time() - days * 86400
+    for label, url in PRESS_FEEDS.items():
+        try:
+            r = requests.get(url, headers=UA, timeout=20)
+            r.raise_for_status()
+            items += [i for i in core.parse_feed(r.content, label, "Crypto") if i["time"].timestamp() >= cutoff]
+        except Exception as ex:
+            errors.append(f"{label} : {type(ex).__name__}")
+    return items, errors
+
+
+def raises_from_news(llm_cfg, cache, items):
+    """Repère les levées de fonds dans les articles grâce à l'IA (résultats mis en cache par article).
+    Renvoie des levées au même format que DefiLlama (montant en M$, investisseurs...)."""
+    cands = [i for i in items if RAISE_KEYWORDS.search(f"{i['title']} {i['summary']}")]
+    todo = [i for i in cands if i["id"] not in cache]
+    for k in range(0, len(todo), 15):
+        batch = todo[k:k + 15]
+        payload = [dict(id=i["id"], titre=i["title"], resume=i["summary"]) for i in batch]
+        r = core.llm_call(llm_cfg, RAISE_PROMPT, json.dumps(payload, ensure_ascii=False), max_tokens=2500)
+        found = {o["id"]: o for o in core.parse_json_array(r["text"]) if isinstance(o, dict) and o.get("id")}
+        for i in batch:
+            cache[i["id"]] = found.get(i["id"])          # None = pas une levée de fonds
+    out, seen = [], set()
+    for i in cands:
+        o = cache.get(i["id"])
+        if not o or not o.get("projet"):
+            continue
+        key = re.sub(r"\W+", "", o["projet"].lower())
+        if key in seen:                                   # même levée reprise par plusieurs médias
+            continue
+        seen.add(key)
+        try:
+            amount = float(o.get("montant_musd")) if o.get("montant_musd") is not None else None
+        except (TypeError, ValueError):
+            amount = None
+        out.append(dict(date=i["time"].timestamp(), name=o["projet"], round=o.get("tour"), amount=amount,
+                        leadInvestors=o.get("investisseurs_principaux") or [],
+                        otherInvestors=o.get("autres_investisseurs") or [],
+                        category=o.get("categorie"), chains=[], source=i["link"],
+                        source_name=i["source"], resume=o.get("resume")))
+    return sorted(out, key=lambda r: r["date"], reverse=True)
 
 
 def fetch_markets(gecko_ids, api_key=None):
@@ -104,7 +177,7 @@ def _lin(x, lo, hi, pts):
     return max(0.0, min(pts, pts * (math.log10(x) - math.log10(lo)) / (math.log10(hi) - math.log10(lo))))
 
 
-def score(p, fees30, rz, mkt):
+def score(p, fees30, rz, mkt, raises_known=True):
     """Renvoie (score 0-100, détail des points, signaux positifs, drapeaux rouges)."""
     tvl = p.get("tvl") or 0
     ch7 = p.get("change_7d")
@@ -166,7 +239,10 @@ def score(p, fees30, rz, mkt):
         red.append("Moins de 5 M$ déposés : projet encore très petit")
 
     total = sum(pts.values())
-    return max(0, min(100, round(total / 90 * 100))), pts, good, red
+    if not raises_known:                       # données de levées indisponibles : on ne pénalise pas
+        pts.pop("Investisseurs", None)
+    denom = 90 if raises_known else 75
+    return max(0, min(100, round(total / denom * 100))), pts, good, red
 
 
 def build(days, min_tvl, gecko_key=None):
@@ -178,9 +254,9 @@ def build(days, min_tvl, gecko_key=None):
     except Exception as ex:
         fees, _ = {}, errors.append(f"Frais DefiLlama : {type(ex).__name__}")
     try:
-        raises = fetch_raises(720)
-    except Exception as ex:
-        raises, _ = [], errors.append(f"Levées DefiLlama : {type(ex).__name__}")
+        raises, raises_known = fetch_raises(720), True
+    except Exception:
+        raises, raises_known = [], False      # réservé à l'offre Pro : le score s'en passe
     try:
         mkts = fetch_markets([p.get("gecko_id") for p in protos], gecko_key)
     except Exception as ex:
@@ -190,7 +266,7 @@ def build(days, min_tvl, gecko_key=None):
         f30 = fees.get(p.get("slug")) or fees.get((p.get("name") or "").lower())
         rz = match_raise(p, raises)
         mkt = mkts.get(p.get("gecko_id"))
-        sc, pts, good, red = score(p, f30, rz, mkt)
+        sc, pts, good, red = score(p, f30, rz, mkt, raises_known)
         out.append(dict(p=p, fees30=f30, raise_=rz, mkt=mkt, score=sc, pts=pts, good=good, red=red,
                         age=int((time.time() - p["listedAt"]) / 86400)))
     return sorted(out, key=lambda x: x["score"], reverse=True), errors

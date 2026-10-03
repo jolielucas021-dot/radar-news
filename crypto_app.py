@@ -57,9 +57,20 @@ def load_projects(days, min_tvl):
     return cc.build(days, min_tvl, secret("COINGECKO_API_KEY"))
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_resource
+def raise_cache():
+    return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_raises(days):
-    return cc.fetch_raises(days)
+    """DefiLlama si disponible (offre Pro), sinon levées repérées par l'IA dans les médias crypto."""
+    try:
+        return cc.fetch_raises(days), "DefiLlama"
+    except Exception:
+        items, _ = cc.press_items(days=min(days, 14))
+        cfg = core.llm_config(lambda k: secret(k))
+        return cc.raises_from_news(cfg, raise_cache(), items), "médias"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -172,21 +183,27 @@ def tab_projects(days, min_tvl, min_score, cats):
 
 
 def tab_raises(min_amount):
-    try:
-        raises = load_raises(60)
-    except Exception as ex:
-        st.error(f"Levées de fonds indisponibles ({type(ex).__name__}).")
-        return
-    rows = sorted([r for r in raises if (r.get("amount") or 0) >= min_amount],
+    with st.spinner("Recherche des levées de fonds dans les médias crypto…"):
+        try:
+            raises, src = load_raises(60)
+        except Exception as ex:
+            st.error(f"Levées de fonds indisponibles ({type(ex).__name__}: {str(ex)[:80]}).")
+            return
+    rows = sorted([r for r in raises if (r.get("amount") or 0) >= min_amount or r.get("amount") is None],
                   key=lambda r: r.get("date") or 0, reverse=True)
-    st.caption(f"{len(rows)} levée(s) d'au moins {min_amount:g} M\\$ sur 60 jours. Un projet qui lève "
-               "des fonds sans avoir encore de token peut en lancer un plus tard, mais rien n'est garanti.")
+    if src == "médias":
+        st.caption(f"{len(rows)} levée(s) repérées par l'IA dans les médias crypto ces derniers jours "
+                   "(The Block, CoinDesk, Decrypt…). Les flux des médias ne remontent que quelques jours : "
+                   "reviens régulièrement. Un projet financé sans token peut en lancer un plus tard, sans garantie.")
+    else:
+        st.caption(f"{len(rows)} levée(s) d'au moins {min_amount:g} M\\$ sur 60 jours (DefiLlama).")
     for r in rows[:80]:
         inv = (r.get("leadInvestors") or []) + (r.get("otherInvestors") or [])
         t1 = cc.is_tier1(inv)
         d = datetime.fromtimestamp(r["date"], timezone.utc).astimezone(core.PARIS)
         with st.container(border=True):
-            st.markdown(f"{'⭐ ' if t1 else ''}**{md(r.get('name'))}** · **{md(r.get('amount'))} M\\$** "
+            amt = f"{r['amount']:g} M\\$" if r.get("amount") is not None else "montant non communiqué"
+            st.markdown(f"{'⭐ ' if t1 else ''}**{md(r.get('name'))}** · **{amt}** "
                         f"({md(r.get('round') or 'tour non précisé')}) · {d:%d/%m/%Y}  \n"
                         f"{md(r.get('category') or r.get('sector') or '')} · "
                         f"{md(', '.join((r.get('chains') or [])[:3]))}")
@@ -196,8 +213,10 @@ def tab_raises(min_amount):
                 st.caption("Avec : " + md(", ".join(r["otherInvestors"][:8])))
             if r.get("valuation"):
                 st.caption(f"Valorisation : {md(r['valuation'])} M\\$")
+            if r.get("resume"):
+                st.caption(md(r["resume"]))
             if r.get("source"):
-                st.caption(f"[Source]({r['source']})")
+                st.caption(f"[Source : {md(r.get('source_name') or 'lien')}]({r['source']})")
 
 
 def tab_trending():
