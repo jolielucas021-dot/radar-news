@@ -11,6 +11,7 @@ Envoie :
 Secrets GitHub (Settings > Secrets and variables > Actions) :
   OPENAI_API_KEY (ou ANTHROPIC_API_KEY), TELEGRAM_BOT_TOKEN, BLS_API_KEY, FINNHUB_API_KEY
   TELEGRAM_CHAT_ID (facultatif : détecté automatiquement après ton /start au bot)
+  CRYPTO_TELEGRAM_BOT_TOKEN : 2e bot dédié aux lancements crypto (sinon tout va dans le 1er bot)
 Variables facultatives : MIN_IMPORTANCE (5), ZONES ("USD,EUR")
 """
 import html
@@ -27,6 +28,7 @@ from core import PARIS
 STATE = Path("state/alerts_state.json")
 ENV = os.environ.get
 TOKEN = ENV("TELEGRAM_BOT_TOKEN", "")
+CRYPTO_TOKEN = ENV("CRYPTO_TELEGRAM_BOT_TOKEN", "") or TOKEN    # 2e bot pour la crypto (sinon le 1er)
 MIN_IMP = int(ENV("MIN_IMPORTANCE") or 5)
 ZONES = [z.strip() for z in (ENV("ZONES") or "USD,EUR").split(",")]
 NOW = datetime.now(timezone.utc)
@@ -48,26 +50,27 @@ def save_state(s):
 
 
 # --------------------------------------------------------------------------- Telegram
-def tg(method, **params):
-    r = requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}", json=params, timeout=15)
+def tg(method, token=None, **params):
+    r = requests.post(f"https://api.telegram.org/bot{token or TOKEN}/{method}", json=params, timeout=15)
     return r.json()
 
 
-def chat_id(state):
-    cid = ENV("TELEGRAM_CHAT_ID") or state.get("chat_id")
+def chat_id(state, token=None, env_name="TELEGRAM_CHAT_ID", key="chat_id"):
+    """Conversation à qui écrire : secret, sinon mémorisée, sinon détectée après un /start au bot."""
+    cid = ENV(env_name) or state.get(key)
     if cid:
         return cid
-    upd = tg("getUpdates").get("result", [])
+    upd = tg("getUpdates", token=token).get("result", [])
     for u in reversed(upd):
         msg = u.get("message") or u.get("channel_post") or {}
         if msg.get("chat", {}).get("id"):
-            state["chat_id"] = msg["chat"]["id"]
-            return state["chat_id"]
+            state[key] = msg["chat"]["id"]
+            return state[key]
     return None
 
 
-def send(cid, text):
-    tg("sendMessage", chat_id=cid, text=text[:4000], parse_mode="HTML",
+def send(cid, text, token=None):
+    tg("sendMessage", token=token, chat_id=cid, text=text[:4000], parse_mode="HTML",
        disable_web_page_preview=True)
 
 
@@ -173,29 +176,52 @@ def alert_earnings(state, cid):
 # --------------------------------------------------------------------------- main
 def main():
     state = load_state()
-    cid = chat_id(state)
-    if not cid:
-        print("Aucun chat Telegram : envoie /start à ton bot puis relance.")
-        save_state(state)
-        return
-    first = not state.get("started")
     key = core.llm_config(ENV)                          # Claude ou OpenAI, détection automatique
     errors = []
-    for name, fn in (("news", lambda: alert_news(state, cid, key)),
-                     ("macro", lambda: alert_macro(state, cid)),
-                     ("résultats", lambda: alert_earnings(state, cid))):
-        if first and name == "news":                     # 1er passage : pas d'avalanche
-            items, _ = core.fetch_feeds(tuple(core.FEEDS))
-            state["news"] = [i["id"] for i in items]
-            continue
+
+    # ===== Bot n°1 : marchés (news, macro, résultats d'entreprises) =====
+    cid = chat_id(state)
+    if not cid:
+        print("Bot marchés : aucun chat Telegram. Envoie /start à ton bot puis relance.")
+    else:
+        first = not state.get("started")
+        for name, fn in (("news", lambda: alert_news(state, cid, key)),
+                         ("macro", lambda: alert_macro(state, cid)),
+                         ("résultats", lambda: alert_earnings(state, cid))):
+            if first and name == "news":                 # 1er passage : pas d'avalanche
+                items, _ = core.fetch_feeds(tuple(core.FEEDS))
+                state["news"] = [i["id"] for i in items]
+                continue
+            try:
+                fn()
+            except Exception as ex:
+                errors.append(f"{name} : {type(ex).__name__}: {ex}")
+        if first:
+            state["started"] = True
+            send(cid, "✅ <b>Radar connecté.</b> Tu recevras ici les news majeures, les rappels avant les "
+                      "annonces macro, les chiffres officiels et les résultats d'entreprises.")
+
+    # ===== Bot n°2 : lancements crypto =====
+    separate = CRYPTO_TOKEN != TOKEN
+    ccid = (chat_id(state, CRYPTO_TOKEN, "CRYPTO_TELEGRAM_CHAT_ID", "crypto_chat_id") if separate else cid)
+    if not ccid:
+        print("Bot crypto : aucun chat Telegram. Envoie /start à ton bot crypto puis relance.")
+    else:
         try:
-            fn()
+            import crypto_alerts
+            first_c = not state.get("crypto_started") or (separate and not state.get("crypto_bot_ok"))
+            errs = crypto_alerts.run(state, lambda t: send(ccid, t, CRYPTO_TOKEN), esc, key,
+                                     first=not state.get("crypto_started"))
+            errors += [f"crypto : {e}" for e in errs]
+            state["crypto_started"] = True
+            if first_c:
+                state["crypto_bot_ok"] = separate
+                send(ccid, "🚀 <b>Veille des lancements crypto activée.</b> Tu recevras ici les annonces de "
+                           "lancement des projets, les cotations, launchpools et airdrops des plateformes, "
+                           "les nouveaux protocoles sérieux et les grosses levées de fonds.", CRYPTO_TOKEN)
         except Exception as ex:
-            errors.append(f"{name} : {type(ex).__name__}: {ex}")
-    if first:
-        state["started"] = True
-        send(cid, "✅ <b>Radar connecté.</b> Tu recevras ici les news majeures, les rappels avant les "
-                  "annonces macro, les chiffres officiels et les résultats d'entreprises.")
+            errors.append(f"crypto : {type(ex).__name__}: {ex}")
+
     for e in errors:
         print("ERREUR", e)
     save_state(state)
