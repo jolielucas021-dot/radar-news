@@ -5,8 +5,9 @@
   📅 Agenda : événements macro (consensus Forex Factory, chiffres officiels BLS),
               résultats d'entreprises (Finnhub), ce qu'attend le marché
 
-Secrets Streamlit (Settings > Secrets) :
-    ANTHROPIC_API_KEY = "sk-ant-..."
+Secrets Streamlit (Settings > Secrets) — UNE des deux clés d'IA suffit :
+    OPENAI_API_KEY    = "sk-..."       # ChatGPT (modèle par défaut : gpt-5-mini)
+    ANTHROPIC_API_KEY = "sk-ant-..."   # Claude (modèle par défaut : claude-haiku-4-5)
     APP_PASSWORD      = "..."
     BLS_API_KEY       = "..."      # gratuit : data.bls.gov/registrationEngine
     FINNHUB_API_KEY   = "..."      # gratuit : finnhub.io/register
@@ -53,9 +54,13 @@ def new_day():
     return s
 
 
+def llm():
+    return core.llm_config(lambda k: secret(k))
+
+
 def cost_today():
-    s = new_day()
-    return s["tok_in"] / 1e6 + s["tok_out"] / 1e6 * 5 + s["searches"] * 0.01
+    s, c = new_day(), llm()
+    return s["tok_in"] / 1e6 * c["price_in"] + s["tok_out"] / 1e6 * c["price_out"] + s["searches"] * 0.01
 
 
 def ask(system, user, max_tokens=3000, web=False):
@@ -64,8 +69,7 @@ def ask(system, user, max_tokens=3000, web=False):
         return dict(text=os.environ.get("RADAR_FAKE", "[]"), sources=[])
     if web and s["searches"] >= int(secret("MAX_RECHERCHES_JOUR", 20)):
         raise RuntimeError("plafond quotidien de recherches web atteint")
-    r = core.claude_call(secret("ANTHROPIC_API_KEY"), system, user,
-                         model=secret("MODEL", core.MODEL), max_tokens=max_tokens, web=web)
+    r = core.llm_call(llm(), system, user, max_tokens=max_tokens, web=web)
     s["tok_in"] += r["tok_in"]
     s["tok_out"] += r["tok_out"]
     s["searches"] += r["searches"]
@@ -97,7 +101,7 @@ def analyze(items, limit=60):
                 res = core.parse_json_array(ask(core.NEWS_PROMPT, json.dumps(payload, ensure_ascii=False),
                                                 max_tokens=4000)["text"])
         except Exception as ex:
-            st.warning(f"Analyse indisponible ({type(ex).__name__}). Vérifie la clé API et le crédit.")
+            st.warning(f"Analyse indisponible ({type(ex).__name__}: {str(ex)[:120]}). Vérifie la clé API et le crédit.")
             return
         for r in res:
             if isinstance(r, dict) and r.get("id"):
@@ -434,7 +438,7 @@ def main():
         section_news()
     else:
         section_agenda()
-    st.caption("Outil d'information, pas un conseil en investissement. Les flux ont quelques minutes "
+    st.caption(f"IA : {llm()['provider']} · modèle {llm()['model']}. Outil d'information, pas un conseil en investissement. Les flux ont quelques minutes "
                "de retard et une IA peut se tromper : vérifie toujours la source.")
 
 

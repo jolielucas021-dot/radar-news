@@ -9,7 +9,7 @@ Envoie :
   4. les résultats des grandes entreprises (BPA et CA vs attentes)
 
 Secrets GitHub (Settings > Secrets and variables > Actions) :
-  ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, BLS_API_KEY, FINNHUB_API_KEY
+  OPENAI_API_KEY (ou ANTHROPIC_API_KEY), TELEGRAM_BOT_TOKEN, BLS_API_KEY, FINNHUB_API_KEY
   TELEGRAM_CHAT_ID (facultatif : détecté automatiquement après ton /start au bot)
 Variables facultatives : MIN_IMPORTANCE (5), ZONES ("USD,EUR")
 """
@@ -86,7 +86,7 @@ def alert_news(state, cid, key):
     scores = {}
     for k in range(0, len(fresh), 40):
         batch = fresh[k:k + 40]
-        r = core.claude_call(key, core.TRIAGE_PROMPT,
+        r = core.llm_call(key, core.TRIAGE_PROMPT,
                              json.dumps([dict(id=i["id"], titre=i["title"]) for i in batch],
                                         ensure_ascii=False), max_tokens=1500)
         scores.update({o["id"]: int(o.get("importance", 1)) for o in core.parse_json_array(r["text"])
@@ -94,7 +94,7 @@ def alert_news(state, cid, key):
     top = [it for it in fresh if scores.get(it["id"], 0) >= MIN_IMP]
     if top:
         payload = [dict(id=i["id"], source=i["source"], titre=i["title"], resume=i["summary"]) for i in top]
-        r = core.claude_call(key, core.NEWS_PROMPT, json.dumps(payload, ensure_ascii=False), max_tokens=3000)
+        r = core.llm_call(key, core.NEWS_PROMPT, json.dumps(payload, ensure_ascii=False), max_tokens=3000)
         full = {o["id"]: o for o in core.parse_json_array(r["text"]) if isinstance(o, dict)}
         for it in top:
             a = full.get(it["id"], {})
@@ -179,7 +179,7 @@ def main():
         save_state(state)
         return
     first = not state.get("started")
-    key = ENV("ANTHROPIC_API_KEY")
+    key = core.llm_config(ENV)                          # Claude ou OpenAI, détection automatique
     errors = []
     for name, fn in (("news", lambda: alert_news(state, cid, key)),
                      ("macro", lambda: alert_macro(state, cid)),

@@ -16,7 +16,6 @@ import requests
 PARIS = ZoneInfo("Europe/Paris")
 NY = ZoneInfo("America/New_York")
 UA = {"User-Agent": "Mozilla/5.0 (RadarNews)"}
-MODEL = "claude-haiku-4-5-20251001"
 
 # ===========================================================================
 # 1. NEWS (flux RSS)
@@ -135,8 +134,39 @@ def parse_json_object(text):
         return {}
 
 
-def claude_call(api_key, system, user, model=MODEL, max_tokens=3000, web=False, max_uses=3):
-    """Renvoie dict(text, sources, tok_in, tok_out, searches)."""
+# Fournisseurs d'IA : Claude (Anthropic) ou ChatGPT (OpenAI), au choix
+DEFAULT_MODELS = {"claude": "claude-haiku-4-5-20251001", "openai": "gpt-5-mini"}
+PRICES = {"claude": (1.0, 5.0), "openai": (0.25, 2.0)}        # $ par million (entrée, sortie)
+
+
+def llm_config(get):
+    """Choisit le fournisseur à partir des secrets. `get(nom)` lit un secret ou renvoie None.
+    Priorité : LLM_PROVIDER s'il est défini ; sinon OPENAI_API_KEY ; sinon ANTHROPIC_API_KEY
+    (une clé qui ne commence pas par sk-ant- est traitée comme une clé OpenAI)."""
+    okey, akey = get("OPENAI_API_KEY"), get("ANTHROPIC_API_KEY")
+    provider = (get("LLM_PROVIDER") or "").lower().strip()
+    if provider not in ("claude", "openai"):
+        if okey:
+            provider = "openai"
+        else:
+            provider = "claude" if (akey or "").startswith("sk-ant-") else "openai"
+    key = (okey or akey) if provider == "openai" else (akey or okey)
+    model = get("MODEL") or DEFAULT_MODELS[provider]
+    pin, pout = PRICES[provider]
+    return dict(provider=provider, key=key, model=model,
+                price_in=float(get("PRICE_IN") or pin), price_out=float(get("PRICE_OUT") or pout))
+
+
+def llm_call(cfg, system, user, max_tokens=3000, web=False, max_uses=3):
+    """Appel unique, quel que soit le fournisseur. Renvoie dict(text, sources, tok_in, tok_out, searches)."""
+    if not cfg.get("key"):
+        raise RuntimeError("aucune clé API (ANTHROPIC_API_KEY ou OPENAI_API_KEY)")
+    if cfg["provider"] == "openai":
+        return _openai_call(cfg["key"], system, user, cfg["model"], max_tokens, web)
+    return _claude_call(cfg["key"], system, user, cfg["model"], max_tokens, web, max_uses)
+
+
+def _claude_call(api_key, system, user, model, max_tokens, web, max_uses):
     from anthropic import Anthropic
     client = Anthropic(api_key=api_key)
     kw = dict(model=model, max_tokens=max_tokens, system=system,
@@ -153,6 +183,37 @@ def claude_call(api_key, system, user, model=MODEL, max_tokens=3000, web=False, 
     return dict(text=text, sources=sources[:5], tok_in=msg.usage.input_tokens,
                 tok_out=msg.usage.output_tokens,
                 searches=(getattr(stu, "web_search_requests", 0) or 0) if stu else 0)
+
+
+def _openai_call(api_key, system, user, model, max_tokens, web):
+    from openai import BadRequestError, OpenAI
+    client = OpenAI(api_key=api_key)
+    # Les modèles GPT-5 "réfléchissent" avant de répondre : cette réflexion consomme aussi
+    # des tokens de sortie, d'où une marge plus large et un effort de réflexion faible.
+    kw = dict(model=model, instructions=system, input=user,
+              max_output_tokens=max(max_tokens * 3, 8000))
+    if web:
+        kw["tools"] = [{"type": "web_search"}]
+    try:
+        resp = client.responses.create(reasoning={"effort": "low"}, **kw)
+    except BadRequestError:
+        resp = client.responses.create(**kw)          # modèle sans réglage de réflexion
+    sources, searches = [], 0
+    for item in resp.output or []:
+        t = getattr(item, "type", "")
+        if t == "web_search_call":
+            searches += 1
+        elif t == "message":
+            for c in getattr(item, "content", None) or []:
+                for a in getattr(c, "annotations", None) or []:
+                    if getattr(a, "type", "") == "url_citation":
+                        src = (getattr(a, "title", "") or "", getattr(a, "url", "") or "")
+                        if src not in sources:
+                            sources.append(src)
+    u = resp.usage
+    return dict(text=resp.output_text or "", sources=sources[:5],
+                tok_in=getattr(u, "input_tokens", 0), tok_out=getattr(u, "output_tokens", 0),
+                searches=searches)
 
 
 # ===========================================================================
