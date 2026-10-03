@@ -31,6 +31,7 @@ jobs:
           MIN_IMPORTANCE: ${{ vars.MIN_IMPORTANCE }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CRYPTO_TELEGRAM_BOT_TOKEN: ${{ secrets.CRYPTO_TELEGRAM_BOT_TOKEN }}
           BLS_API_KEY: ${{ secrets.BLS_API_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
       - uses: actions/cache/save@v4
