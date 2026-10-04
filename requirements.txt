@@ -3,3 +3,4 @@ feedparser
 requests
 anthropic
 openai
+yfinance

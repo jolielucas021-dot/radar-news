@@ -78,7 +78,7 @@ def cat(c):
 
 
 def pct(x, dec=0):
-    return f"{x:+.{dec}f}".replace(".", ",") + " %"
+    return f"{x:+.{dec}f}".replace(".", ",") + "\u00a0%"
 
 
 def grade(score):
@@ -118,7 +118,7 @@ font-size:.85rem;padding:.35rem 0;border-radius:6px;}
 .rd-scale-legend{display:flex;justify-content:space-between;color:var(--muted);font-size:.8rem;margin-top:.3rem;}
 .stTabs [role="tablist"]{gap:.35rem;border-bottom:none!important;box-shadow:none!important;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;}
 .stTabs [role="tablist"]::after,.stTabs [role="tablist"]::before{display:none!important;}
-.stTabs [data-testid="stTab"]{background:#E4E9F0;border-radius:999px;padding:.4rem .85rem;height:auto;white-space:nowrap;
+.stTabs [data-testid="stTab"]{background:#E4E9F0;border-radius:999px;padding:.4rem .75rem;height:auto;white-space:nowrap;
 color:var(--ink);border:none!important;box-shadow:none!important;}
 .stTabs [data-testid="stTab"] p{font-weight:700;font-size:.88rem;margin:0;}
 .stTabs [data-testid="stTab"][aria-selected="true"]{background:var(--ink);}
@@ -343,7 +343,10 @@ def tab_raises():
         inv_l, inv_o = r.get("leadInvestors") or [], r.get("otherInvestors") or []
         star = '<span class="rd-star">★</span>' if cc.is_tier1(inv_l + inv_o) else ""
         amt = f"{fr(r['amount'], 0) if r['amount'] >= 10 else fr(r['amount'])} M$" if r.get("amount") else "n.c."
-        meta = ", ".join(x for x in (r.get("round"), r.get("category"), jour(r["date"]) if r.get("date") else None) if x)
+        nature = {"token": "token déjà coté", "sans token": "pas encore de token",
+                  "entreprise": "entreprise privée, pas de token"}.get(r.get("nature"))
+        meta = ", ".join(x for x in (r.get("round"), r.get("category"), nature,
+                                     jour(r["date"]) if r.get("date") else None) if x)
         inv = ""
         if inv_l:
             inv = "Menée par " + h(", ".join(inv_l)) + (f", avec {h(', '.join(inv_o[:5]))}" if inv_o else "")
@@ -380,6 +383,167 @@ def tab_trending():
                    'target="_blank" rel="noopener">Voir</a></div></div>')
 
 
+
+# ===========================================================================
+# SIMULATEUR D'ACHATS RÉGULIERS (DCA) — backtest sur prix historiques réels
+# ===========================================================================
+CRYPTOS = {"Bitcoin (BTC)": "BTC-EUR", "Ethereum (ETH)": "ETH-EUR", "Solana (SOL)": "SOL-EUR",
+           "BNB": "BNB-EUR", "XRP": "XRP-EUR", "Cardano (ADA)": "ADA-EUR", "Dogecoin (DOGE)": "DOGE-EUR"}
+FREQS = ["Chaque jour", "Chaque semaine", "Toutes les 2 semaines", "Chaque mois"]
+JOURS_SEM = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_prices(ticker):
+    """Cours de clôture quotidiens en euros (Yahoo Finance, gratuit)."""
+    if TEST_MODE:
+        import numpy as np
+        import pandas as pd
+        idx = pd.date_range("2018-01-01", periods=2800, freq="D")
+        r = np.random.default_rng(0).normal(0.0012, 0.04, len(idx))
+        return pd.Series(8000 * np.exp(np.cumsum(r)), idx)
+    import yfinance as yf
+    df = yf.download(ticker, period="max", interval="1d", auto_adjust=True, progress=False)
+    s = df["Close"]
+    if hasattr(s, "columns"):
+        s = s.iloc[:, 0]
+    s.index = s.index.tz_localize(None) if s.index.tz is not None else s.index
+    return s.dropna()
+
+
+def purchase_dates(index, freq, weekday, monthday):
+    if freq == "Chaque jour":
+        return index
+    if freq in ("Chaque semaine", "Toutes les 2 semaines"):
+        d = index[index.weekday == weekday]
+        return d[::2] if freq == "Toutes les 2 semaines" else d
+    out, seen = [], set()                         # chaque mois : 1er jour coté >= jour choisi
+    for ts in index:
+        key = (ts.year, ts.month)
+        if key not in seen and ts.day >= min(monthday, 28):
+            seen.add(key)
+            out.append(ts)
+    return index[index.isin(out)]
+
+
+def simulate(prices, dates, amount, fee):
+    """Renvoie (valeur du portefeuille, montant investi) jour par jour."""
+    import pandas as pd
+    units = pd.Series(0.0, index=prices.index)
+    units.loc[dates] = amount * (1 - fee) / prices.loc[dates]
+    invested = pd.Series(0.0, index=prices.index)
+    invested.loc[dates] = amount
+    return units.cumsum() * prices, invested.cumsum()
+
+
+def max_drawdown(v):
+    return float((v / v.cummax() - 1).min())
+
+
+def tab_simulator():
+    import altair as alt
+    import pandas as pd
+    html_block('<div class="rd-count">Teste une stratégie d\'achats réguliers sur les vrais prix passés, '
+               "sans risquer un euro. Les montants sont en euros, frais déduits.</div>")
+    c1, c2 = st.columns(2)
+    name = c1.selectbox("Crypto", list(CRYPTOS))
+    amount = c2.number_input("Montant par achat (€)", 5, 10_000, 50, step=5)
+    freq = st.radio("Fréquence", FREQS, index=1, horizontal=True)
+    weekday, monthday = 0, 1
+    if freq in ("Chaque semaine", "Toutes les 2 semaines"):
+        weekday = JOURS_SEM.index(st.selectbox("Jour d'achat", JOURS_SEM))
+    elif freq == "Chaque mois":
+        monthday = st.slider("Jour du mois", 1, 28, 1)
+    with st.spinner("Chargement des prix historiques…"):
+        try:
+            prices = load_prices(CRYPTOS[name])
+        except Exception as ex:
+            st.error(f"Prix indisponibles ({type(ex).__name__}). Réessaie dans quelques minutes.")
+            return
+    if len(prices) < 60:
+        st.error("Pas assez d'historique pour cette crypto.")
+        return
+    first, last = prices.index[0].date(), prices.index[-1].date()
+    default_start = max(first, (prices.index[-1] - pd.Timedelta(days=3 * 365)).date())
+    c3, c4 = st.columns(2)
+    start = c3.date_input("Début", default_start, min_value=first, max_value=last, format="DD/MM/YYYY")
+    end = c4.date_input("Fin", last, min_value=first, max_value=last, format="DD/MM/YYYY")
+    fee = st.slider("Frais par achat", 0.0, 4.0, 0.6, 0.1, format="%.1f %%",
+                    help="Carte bancaire : souvent 1,5 à 4 %. Achat depuis un solde en euros : souvent 0,1 à 1 %.") / 100
+    if start >= end:
+        st.warning("La date de début doit précéder la date de fin.")
+        return
+
+    p = prices.loc[pd.Timestamp(start):pd.Timestamp(end)]
+    dates = purchase_dates(p.index, freq, weekday, monthday)
+    if len(dates) == 0:
+        st.warning("Aucun achat sur cette période : allonge-la.")
+        return
+    value, invested = simulate(p, dates, amount, fee)
+    total_in, final = float(invested.iloc[-1]), float(value.iloc[-1])
+    gain = final / total_in - 1
+    avg_price = total_in * (1 - fee) / float((value / p).iloc[-1])
+    worst = float((value / invested.where(invested > 0) - 1).min())
+    # Comparaison : tout investir dès le premier jour
+    lump = total_in * (1 - fee) / float(p.iloc[0]) * p
+    lump_gain = float(lump.iloc[-1]) / total_in - 1
+
+    def card(v, l, cls=""):
+        return f'<div><b class="{cls}">{h(v)}</b><span>{h(l)}</span></div>'
+    html_block('<div class="rd-card" style="display:block"><div class="rd-name">Résultat</div>'
+               f'<div class="rd-meta">{len(dates)} achats de {fr(amount, 0)} € entre le '
+               f'{start:%d/%m/%Y} et le {end:%d/%m/%Y}</div><div class="rd-metrics">'
+               + card(f"{fr(total_in, 0)} €", "investis au total")
+               + card(f"{fr(final, 0)} €", "valeur finale")
+               + card(pct(gain * 100, 1), "de gain ou de perte", "rd-up" if gain >= 0 else "rd-down")
+               + card(price(avg_price).replace("$", "€"), f"prix moyen d'achat (dernier : {price(float(p.iloc[-1])).replace('$', '€')})")
+               + card(pct(worst * 100, 1), "pire moment par rapport à l'investi", "rd-down" if worst < 0 else "")
+               + card(pct(lump_gain * 100, 1), "si tout avait été investi le 1er jour",
+                      "rd-up" if lump_gain >= 0 else "rd-down")
+               + "</div></div>")
+
+    df = pd.DataFrame({"Date": value.index, "Valeur du portefeuille": value.values,
+                       "Montant investi": invested.values}).melt("Date", var_name="Série", value_name="€")
+    chart = (alt.Chart(df).mark_line(strokeWidth=2.5)
+             .encode(x=alt.X("Date:T", title=None, axis=alt.Axis(format="%m/%Y", labelColor="#5B6678", grid=False)),
+                     y=alt.Y("€:Q", title=None, axis=alt.Axis(labelColor="#5B6678", gridColor="#E4E9F0",
+                                                             labelExpr="replace(datum.label, ',', ' ') + ' €'")),
+                     color=alt.Color("Série:N", scale=alt.Scale(domain=["Valeur du portefeuille", "Montant investi"],
+                                                                range=["#2F5BEA", "#9AA5B5"]),
+                                     legend=alt.Legend(orient="top", title=None, labelColor="#14213D")))
+             .properties(height=260).configure_view(strokeWidth=0).configure(background="transparent"))
+    st.altair_chart(chart, use_container_width=True)
+
+    # Robustesse : même stratégie, même durée, mais démarrée à chaque mois de l'historique
+    span = pd.Timestamp(end) - pd.Timestamp(start)
+    outcomes = []
+    for s0 in pd.date_range(prices.index[0], prices.index[-1] - span, freq="MS"):
+        w = prices.loc[s0:s0 + span]
+        if len(w) < 30:
+            continue
+        d = purchase_dates(w.index, freq, weekday, monthday)
+        if len(d) == 0:
+            continue
+        v, inv = simulate(w, d, amount, fee)
+        outcomes.append(float(v.iloc[-1] / inv.iloc[-1] - 1))
+    if len(outcomes) >= 6:
+        s = pd.Series(outcomes)
+        html_block('<div class="rd-dossier"><h4>Et si tu avais commencé à un autre moment ?</h4>'
+                   f"<p>La même stratégie, sur la même durée, a été rejouée en démarrant à {len(s)} dates "
+                   f"différentes de l'historique.</p>"
+                   f"<p><b>{fr((s < 0).mean() * 100, 0)} %</b> de ces périodes finissent en perte. "
+                   f"Dans le pire cas : <b>{pct(s.min() * 100, 0)}</b>. Cas médian : <b>{pct(s.median() * 100, 0)}</b>. "
+                   f"Meilleur cas : <b>{pct(s.max() * 100, 0)}</b>.</p>"
+                   "<p>Plus cet écart est grand, plus le résultat ci-dessus dépend de la chance du calendrier.</p></div>")
+    else:
+        html_block('<div class="rd-count">Période trop longue par rapport à l\'historique pour tester '
+                   "d'autres dates de départ. Raccourcis-la pour voir le test de robustesse.</div>")
+    html_block('<p class="rd-note">Les performances passées ne préjugent pas des performances futures. '
+               "L'historique des cryptos est court et marqué par des hausses exceptionnelles, et seules les "
+               "cryptos qui ont survécu ont un long historique : des milliers d'autres ont disparu. L'heure "
+               "d'achat n'est pas simulée (prix de clôture quotidien) : sur le long terme, elle compte très peu.</p>")
+
+
 def password_ok():
     pw = None if TEST_MODE else secret("APP_PASSWORD")
     if not pw or st.session_state.get("auth"):
@@ -405,13 +569,15 @@ def main():
                '<div class="rd-scale-legend"><span>Solide</span><span>À surveiller</span><span>Fragile</span></div></div>')
     if not password_ok():
         st.stop()
-    t1, t2, t3 = st.tabs(["Projets", "Levées", "Tendances"])
+    t1, t2, t3, t4 = st.tabs(["Projets", "Levées", "Tendances", "Tester"])
     with t1:
         tab_projects()
     with t2:
         tab_raises()
     with t3:
         tab_trending()
+    with t4:
+        tab_simulator()
     html_block('<p class="rd-note">Données DefiLlama et CoinGecko, levées repérées dans les médias crypto. '
                "La note mesure le sérieux apparent d'un projet, pas son potentiel de hausse : ce n'est pas un "
                "conseil en investissement. Ne mise que ce que tu peux te permettre de perdre.</p>")
