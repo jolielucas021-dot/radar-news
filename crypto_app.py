@@ -12,6 +12,8 @@ Facultatif : COINGECKO_API_KEY (clé "Demo" gratuite sur coingecko.com/api)
 import html
 import json
 import os
+
+import requests
 from datetime import datetime, timezone
 
 import streamlit as st
@@ -166,8 +168,8 @@ border-radius:14px;padding:.85rem 1rem;margin-bottom:.5rem;}
 .rd-inv{font-size:.9rem;margin-top:.3rem;}
 .rd-star{color:var(--warn);margin-left:.3rem;}
 .rd-rank{font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:1.3rem;color:#B6C0CE;min-width:1.8rem;}
-.rd-up{color:var(--good);font-weight:700;}
-.rd-down{color:var(--bad);font-weight:700;}
+.rd-up,.rd-metrics b.rd-up{color:var(--good);font-weight:700;}
+.rd-down,.rd-metrics b.rd-down{color:var(--bad);font-weight:700;}
 .stApp .rd-note{color:var(--muted);font-size:.82rem!important;line-height:1.45;margin:1.5rem 0 0;}
 @media (max-width:480px){.rd-hero h1{font-size:2rem;}.rd-card{flex-direction:column;gap:.7rem;padding:.9rem;}
 .rd-grade{flex-direction:row;gap:.6rem;align-self:stretch;justify-content:flex-start;padding:.5rem .8rem;flex-basis:auto;}
@@ -440,6 +442,179 @@ def max_drawdown(v):
     return float((v / v.cummax() - 1).min())
 
 
+
+# ===========================================================================
+# BACKTEST "ACHAT PUIS REVENTE CHAQUE SEMAINE" (prix horaires)
+# ===========================================================================
+PAIRS = {"Bitcoin (BTC)": "BTCEUR", "Ethereum (ETH)": "ETHEUR", "Solana (SOL)": "SOLEUR",
+         "BNB": "BNBEUR", "XRP": "XRPEUR", "Cardano (ADA)": "ADAEUR", "Dogecoin (DOGE)": "DOGEEUR"}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_hourly(pair):
+    """Prix horaires (ouverture de chaque heure, heure de Paris). Binance données publiques,
+    sinon Yahoo Finance (2 dernières années seulement)."""
+    import pandas as pd
+    if TEST_MODE:
+        import numpy as np
+        idx = pd.date_range("2022-01-01", periods=24 * 900, freq="h", tz="Europe/Paris")
+        r = np.random.default_rng(1).normal(0.00004, 0.007, len(idx))
+        return pd.Series(30000 * np.exp(np.cumsum(r)), idx), "test"
+    rows, start = [], 1577836800000                      # 1er janvier 2020
+    try:
+        for _ in range(80):
+            r = requests.get("https://data-api.binance.vision/api/v3/klines", timeout=20,
+                             params={"symbol": pair, "interval": "1h", "startTime": start, "limit": 1000})
+            r.raise_for_status()
+            batch = r.json()
+            if not batch:
+                break
+            rows += [(b[0], float(b[1])) for b in batch]
+            start = batch[-1][0] + 3_600_000
+            if len(batch) < 1000:
+                break
+        if len(rows) < 500:
+            raise ValueError("historique trop court")
+        s = pd.Series([v for _, v in rows], pd.to_datetime([t for t, _ in rows], unit="ms", utc=True))
+        return s.tz_convert("Europe/Paris"), "Binance"
+    except Exception:
+        import yfinance as yf
+        df = yf.download(pair[:-3] + "-EUR", period="730d", interval="1h", auto_adjust=True, progress=False)
+        s = df["Open"]
+        if hasattr(s, "columns"):
+            s = s.iloc[:, 0]
+        return s.dropna().tz_convert("Europe/Paris"), "Yahoo Finance (2 ans)"
+
+
+def weekly_trades(p, buy_d, buy_h, sell_d, sell_h, cost):
+    """Liste des trades : achat au prix d'ouverture de l'heure choisie, revente idem."""
+    import pandas as pd
+    hold = ((sell_d - buy_d) % 7) * 24 + (sell_h - buy_h)
+    if hold <= 0:
+        hold += 7 * 24
+    buys = p[(p.index.weekday == buy_d) & (p.index.hour == buy_h)]
+    out = []
+    for t, pb in buys.items():
+        ts = t + pd.Timedelta(hours=hold)
+        if ts in p.index:
+            ps = p.loc[ts]
+            out.append((t, ts, pb, ps, ps * (1 - cost) / (pb * (1 + cost)) - 1))
+    return pd.DataFrame(out, columns=["achat", "vente", "prix_achat", "prix_vente", "rendement"]), hold
+
+
+def tab_weekly():
+    import altair as alt
+    import numpy as np
+    import pandas as pd
+    html_block('<div class="rd-count">Teste une stratégie qui achète à un jour et une heure fixes, puis revend '
+               "à un autre moment de la semaine, sur les vrais prix heure par heure. Heures de Paris.</div>")
+    name = st.selectbox("Crypto", list(PAIRS), key="wk_crypto")
+    c1, c2 = st.columns(2)
+    buy_d = JOURS_SEM.index(c1.selectbox("Achat le", JOURS_SEM, index=1))
+    buy_h = c2.selectbox("à", list(range(24)), index=15, format_func=lambda x: f"{x} h", key="bh")
+    c3, c4 = st.columns(2)
+    sell_d = JOURS_SEM.index(c3.selectbox("Revente le", JOURS_SEM, index=3))
+    sell_h = c4.selectbox("à", list(range(24)), index=16, format_func=lambda x: f"{x} h", key="sh")
+    c5, c6 = st.columns(2)
+    capital = c5.number_input("Capital de départ (€)", 100, 1_000_000, 1000, step=100)
+    cost = c6.slider("Frais + écart par opération", 0.0, 1.0, 0.15, 0.05, format="%.2f %%",
+                     help="Payés à l'achat ET à la revente. Ordre au marché sur une grande plateforme : "
+                          "souvent 0,1 à 0,2 %. Achat simple dans une appli : souvent bien plus.") / 100
+
+    with st.spinner("Chargement des prix heure par heure (peut prendre 20 secondes la première fois)…"):
+        try:
+            p, src = load_hourly(PAIRS[name])
+        except Exception as ex:
+            st.error(f"Prix horaires indisponibles ({type(ex).__name__}). Réessaie plus tard.")
+            return
+    p = p.tz_localize(None)                  # heure "murale" de Paris (gère les changements d'heure)
+    p = p[~p.index.duplicated()]
+    trades, hold = weekly_trades(p, buy_d, buy_h, sell_d, sell_h, cost)
+    if len(trades) < 10:
+        st.warning("Pas assez de trades sur l'historique disponible.")
+        return
+    r = trades["rendement"]
+    equity = capital * (1 + r).cumprod()
+    years = (trades["vente"].iloc[-1] - trades["achat"].iloc[0]).days / 365.25
+    total = equity.iloc[-1] / capital - 1
+    cagr = (1 + total) ** (1 / years) - 1 if years > 0 and total > -1 else float("nan")
+    dd = max_drawdown(pd.concat([pd.Series([capital]), equity]))
+    bh = p.iloc[-1] / p.loc[trades["achat"].iloc[0]] - 1
+    bh_cagr = (1 + bh) ** (1 / years) - 1 if years > 0 else float("nan")
+    wins = (r > 0).mean()
+    t_stat = r.mean() / (r.std(ddof=1) / np.sqrt(len(r))) if r.std() > 0 else 0
+
+    def card(v, l, cls=""):
+        return f'<div><b class="{cls}">{h(v)}</b><span>{h(l)}</span></div>'
+    up = lambda x: "rd-up" if x >= 0 else "rd-down"
+    html_block('<div class="rd-card" style="display:block"><div class="rd-name">Résultat</div>'
+               f'<div class="rd-meta">{len(r)} semaines, du {trades["achat"].iloc[0]:%d/%m/%Y} au '
+               f'{trades["vente"].iloc[-1]:%d/%m/%Y}. Position tenue {hold} h par semaine '
+               f'({fr(hold / 168 * 100, 0)} % du temps). Source : {h(src)}.</div><div class="rd-metrics">'
+               + card(f"{fr(equity.iloc[-1], 0)} €", f"pour {fr(capital, 0)} € au départ")
+               + card(pct(total * 100, 0), "de performance totale", up(total))
+               + card(pct(cagr * 100, 1), "par an en moyenne", up(cagr))
+               + card(pct(dd * 100, 0), "pire baisse du capital (max drawdown)", "rd-down")
+               + card(f"{fr(wins * 100, 0)} %", "de semaines gagnantes")
+               + card(pct(r.mean() * 100, 2), "en moyenne par semaine, frais déduits", up(r.mean()))
+               + card(pct(bh * 100, 0), f"en gardant simplement la crypto ({pct(bh_cagr * 100, 1)} par an)", up(bh))
+               + card(fr(t_stat, 2), "score statistique (au-dessus de 2 = résultat probablement pas dû au hasard)",
+                      "rd-up" if t_stat >= 2 else "")
+               + "</div></div>")
+
+    ser = pd.DataFrame({"Date": equity.index.map(lambda i: trades["vente"].iloc[i]), "Stratégie": equity.values})
+    ser["Garder la crypto"] = [capital * p.loc[t] / p.loc[trades["achat"].iloc[0]] for t in trades["vente"]]
+    df = ser.melt("Date", var_name="Série", value_name="€")
+    st.altair_chart(
+        alt.Chart(df).mark_line(strokeWidth=2.3)
+        .encode(x=alt.X("Date:T", title=None, axis=alt.Axis(format="%m/%Y", labelColor="#5B6678", grid=False)),
+                y=alt.Y("€:Q", title=None, axis=alt.Axis(labelColor="#5B6678", gridColor="#E4E9F0",
+                                                         labelExpr="replace(datum.label, ',', ' ') + ' €'")),
+                color=alt.Color("Série:N", scale=alt.Scale(domain=["Stratégie", "Garder la crypto"],
+                                                           range=["#2F5BEA", "#9AA5B5"]),
+                                legend=alt.Legend(orient="top", title=None, labelColor="#14213D")))
+        .properties(height=260).configure_view(strokeWidth=0).configure(background="transparent"),
+        use_container_width=True)
+
+    # --- Est-ce que ce créneau est vraiment spécial ? Tous les créneaux d'achat, même durée de détention
+    reg = p.asfreq("h")
+    fwd = (reg.shift(-hold) * (1 - cost) / (reg * (1 + cost)) - 1).dropna()
+    grid = fwd.groupby([fwd.index.weekday, fwd.index.hour]).mean() * 100
+    grid.index.names = ["j", "h"]
+    gdf = grid.reset_index(name="moy")
+    gdf["Jour"] = gdf["j"].map(lambda d: JOURS_SEM[d][:3])
+    rank = int((grid > grid.loc[(buy_d, buy_h)]).sum()) + 1
+    first, second = r.iloc[: len(r) // 2], r.iloc[len(r) // 2:]
+    html_block('<div class="rd-dossier"><h4>Ce créneau est-il vraiment spécial ?</h4>'
+               f"<p>J'ai testé les <b>168 créneaux d'achat</b> possibles de la semaine (chaque jour, chaque heure), "
+               f"avec la même durée de détention de {hold} h. Ton créneau arrive <b>{rank}e sur 168</b>.</p>"
+               f"<p>Première moitié de l'historique : <b>{pct(first.mean() * 100, 2)}</b> par semaine. "
+               f"Seconde moitié : <b>{pct(second.mean() * 100, 2)}</b>. Si le signe change d'une moitié à "
+               "l'autre, l'effet n'est probablement pas stable.</p>"
+               "<p>Attention : en testant 168 créneaux, quelques-uns sortent forcément très bien <i>par hasard</i>. "
+               "Choisir le meilleur après coup, c'est de la sur-optimisation : il faut un score statistique "
+               "nettement au-dessus de 2 et un résultat positif sur les deux moitiés pour y croire un peu.</p></div>")
+    heat = (alt.Chart(gdf).mark_rect(cornerRadius=2)
+            .encode(x=alt.X("h:O", title="Heure d'achat", axis=alt.Axis(labelColor="#5B6678", values=[0, 6, 12, 18, 23])),
+                    y=alt.Y("Jour:N", title=None, sort=[j[:3] for j in JOURS_SEM],
+                            axis=alt.Axis(labelColor="#5B6678", labelOverlap=False)),
+                    color=alt.Color("moy:Q", title="% / sem.",
+                                    scale=alt.Scale(scheme="redyellowgreen", domainMid=0)),
+                    tooltip=["Jour", "h", alt.Tooltip("moy:Q", format=".2f")])
+            .properties(height=230))
+    mark = (alt.Chart(pd.DataFrame({"h": [buy_h], "Jour": [JOURS_SEM[buy_d][:3]]}))
+            .mark_rect(fill=None, stroke="#14213D", strokeWidth=2.5)
+            .encode(x="h:O", y=alt.Y("Jour:N", sort=[j[:3] for j in JOURS_SEM])))
+    st.altair_chart((heat + mark).configure_view(strokeWidth=0).configure(background="transparent"),
+                    use_container_width=True)
+    st.caption("Rendement moyen par semaine selon le créneau d'achat (même durée de détention). "
+               "Le cadre foncé = ton créneau.")
+    html_block('<p class="rd-note">Les prix utilisés sont ceux de l\'ouverture de chaque heure : en réel, ton '
+               "ordre peut s'exécuter un peu plus haut ou plus bas. Fiscalité en France : revendre contre des euros "
+               "est imposable à chaque fois ; échanger contre une autre crypto ou un stablecoin ne l'est pas tant "
+               "que tu ne repasses pas en euros. Les performances passées ne préjugent pas des performances futures.</p>")
+
+
 def tab_simulator():
     import altair as alt
     import pandas as pd
@@ -577,7 +752,9 @@ def main():
     with t3:
         tab_trending()
     with t4:
-        tab_simulator()
+        mode = st.radio("Type de test", ["Achat puis revente chaque semaine", "Achats réguliers (DCA)"],
+                        horizontal=True, label_visibility="collapsed")
+        tab_weekly() if mode.startswith("Achat puis") else tab_simulator()
     html_block('<p class="rd-note">Données DefiLlama et CoinGecko, levées repérées dans les médias crypto. '
                "La note mesure le sérieux apparent d'un projet, pas son potentiel de hausse : ce n'est pas un "
                "conseil en investissement. Ne mise que ce que tu peux te permettre de perdre.</p>")
